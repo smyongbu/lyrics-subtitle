@@ -1,0 +1,14 @@
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地测试素材（按需保留，默认不上传大文件）
+*.mov
+*.webm
+*.mp4
+*.ass

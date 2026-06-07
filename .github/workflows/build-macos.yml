@@ -1,0 +1,71 @@
+name: Build macOS App
+
+# 手动触发（在 GitHub 仓库 Actions 页点 "Run workflow"），或推送 v 开头的 tag 时自动构建
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-macos:
+    # 使用 Intel(x86_64) 运行器：产出的 app 在 Intel Mac 原生运行，
+    # 在 Apple 芯片(M 系列)Mac 上通过 Rosetta 2 运行，兼容所有 Mac。
+    # 同时 evermeet.cx 的 ffmpeg 为完整静态版（含 libass，subtitles 滤镜可用）。
+    runs-on: macos-13
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 下载 macOS 静态 ffmpeg（含 libass）
+        run: |
+          set -e
+          echo "下载 evermeet.cx 最新静态 ffmpeg..."
+          curl -L -o ffmpeg.zip "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"
+          unzip -o ffmpeg.zip
+          chmod +x ffmpeg
+          echo "=== 校验 ffmpeg 可运行并具备所需能力 ==="
+          ./ffmpeg -hide_banner -version | head -1
+          # 缺少任一关键能力则立即失败（避免打出无法导出视频的残废包）
+          ./ffmpeg -hide_banner -filters  | grep -q ' subtitles ' || { echo "❌ 缺少 subtitles 滤镜(libass)"; exit 1; }
+          ./ffmpeg -hide_banner -encoders | grep -q 'prores_ks'   || { echo "❌ 缺少 prores_ks 编码器"; exit 1; }
+          ./ffmpeg -hide_banner -encoders | grep -q 'libvpx-vp9'  || { echo "❌ 缺少 libvpx-vp9 编码器"; exit 1; }
+          ./ffmpeg -hide_banner -encoders | grep -q 'qtrle'       || { echo "❌ 缺少 qtrle 编码器"; exit 1; }
+          ./ffmpeg -hide_banner -encoders | grep -q 'libx264'     || { echo "❌ 缺少 libx264 编码器"; exit 1; }
+          echo "✅ ffmpeg 能力齐全"
+
+      - name: PyInstaller 打包为独立 .app（内置 ffmpeg）
+        run: |
+          set -e
+          pyinstaller --onefile --windowed \
+            --name "滚动字幕生成器" \
+            --add-binary "ffmpeg:." \
+            --noconfirm --clean \
+            字幕.py
+          echo "=== dist 产物 ==="
+          ls -la dist
+
+      - name: 打包 .app 为 zip
+        run: |
+          set -e
+          cd dist
+          # -y 保留软链接，确保 .app 结构完整
+          zip -r -y "滚动字幕生成器-macos.zip" "滚动字幕生成器.app"
+          ls -la
+
+      - name: 上传构建产物（在 Actions 运行页底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/滚动字幕生成器-macos.zip
+          if-no-files-found: error
