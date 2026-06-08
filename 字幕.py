@@ -109,6 +109,75 @@ def parse_srt(srt_path):
                     })
     return subs
 
+def parse_lrc(lrc_path):
+    """解析 LRC 歌词文件，返回与 parse_srt 相同结构的 [{start,end,text}, ...]。
+    LRC 只含每行起始时间，结束时间取下一行起始（最后一行默认 +4 秒）。
+    支持一行多个时间标签、[offset:ms] 偏移，并自动跳过 [ti:]/[ar:] 等元数据标签。"""
+    content = ""
+    for enc in ['utf-8-sig', 'utf-8', 'gbk', 'utf-16', 'big5']:
+        try:
+            with open(lrc_path, 'r', encoding=enc) as f:
+                content = f.read().replace('\r\n', '\n')
+            break
+        except Exception:
+            continue
+    if not content:
+        try:
+            with open(lrc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read().replace('\r\n', '\n')
+        except Exception:
+            return []
+
+    # 时间标签：[mm:ss.xx] / [mm:ss:xx] / [mm:ss]
+    time_re = re.compile(r'\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]')
+
+    # 读取 offset（毫秒，正值表示歌词提前）
+    offset = 0.0
+    m_off = re.search(r'\[offset:\s*([+-]?\d+)\s*\]', content, re.IGNORECASE)
+    if m_off:
+        try:
+            offset = int(m_off.group(1)) / 1000.0
+        except Exception:
+            offset = 0.0
+
+    entries = []
+    for line in content.split('\n'):
+        tags = list(time_re.finditer(line))
+        if not tags:
+            continue
+        text = time_re.sub('', line).strip()
+        if not text:
+            continue
+        for t in tags:
+            mm = int(t.group(1))
+            ss = int(t.group(2))
+            frac = t.group(3) or '0'
+            # 两位为厘秒、三位为毫秒
+            frac_secs = int(frac.ljust(3, '0')[:3]) / 1000.0 if len(frac) == 3 else int(frac.ljust(2, '0')[:2]) / 100.0
+            start = mm * 60 + ss + frac_secs - offset
+            if start < 0:
+                start = 0.0
+            entries.append({'start': start, 'text': text})
+
+    if not entries:
+        return []
+
+    entries.sort(key=lambda e: e['start'])
+
+    subs = []
+    for i, e in enumerate(entries):
+        end = entries[i + 1]['start'] if i < len(entries) - 1 else e['start'] + 4.0
+        if end <= e['start']:
+            end = e['start'] + 0.5
+        subs.append({'start': e['start'], 'end': end, 'text': e['text']})
+    return subs
+
+def parse_subtitle(path):
+    """根据扩展名自动选择解析器（.lrc → LRC，其余按 SRT 处理）。"""
+    if os.path.splitext(path)[1].lower() == '.lrc':
+        return parse_lrc(path)
+    return parse_srt(path)
+
 def hex_to_ass_color(hex_str):
     hex_str = hex_str.lstrip('#')
     r = hex_str[0:2]
@@ -117,9 +186,9 @@ def hex_to_ass_color(hex_str):
     return f"&H{b}{g}{r}&"
 
 def core_converter(srt_path, ass_path, font_name, fs_hl, fs_norm, row_gap, hl_color_ass, normal_color_ass, width, height):
-    subs = parse_srt(srt_path)
+    subs = parse_subtitle(srt_path)
     if not subs:
-        raise ValueError("未检测到任何兼容的 SRT 字幕内容，或文件编码完全损坏。")
+        raise ValueError("未检测到任何兼容的字幕内容（SRT/LRC），或文件编码完全损坏。")
 
     TRANS_DURATION = 0.38
     
@@ -342,7 +411,7 @@ class AppMusicLyricsApp:
         frame_file = ttk.LabelFrame(left_panel, text=" 1. 文件选择 ", padding=10)
         frame_file.pack(fill="x", padx=15, pady=5)
 
-        ttk.Label(frame_file, text="SRT 文件:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame_file, text="选择文件:").grid(row=0, column=0, sticky="w")
         self.entry_srt = ttk.Entry(frame_file, width=28)
         self.entry_srt.grid(row=0, column=1, sticky="w", padx=5, pady=2)
         ttk.Button(frame_file, text="浏览...", command=self.select_srt).grid(row=0, column=2, padx=2)
@@ -822,7 +891,12 @@ class AppMusicLyricsApp:
         self.lbl_time_total.config(text=f" / {self._fmt_time(total)}")
 
     def select_srt(self):
-        file_path = filedialog.askopenfilename(filetypes=[("SRT Subtitles", "*.srt")])
+        file_path = filedialog.askopenfilename(filetypes=[
+            ("字幕/歌词文件", "*.srt *.lrc"),
+            ("SRT 字幕", "*.srt"),
+            ("LRC 歌词", "*.lrc"),
+            ("所有文件", "*.*"),
+        ])
         if not file_path:
             return
         self.entry_srt.delete(0, tk.END)
@@ -830,7 +904,7 @@ class AppMusicLyricsApp:
 
         # 解析並載入到預覽
         try:
-            subs = parse_srt(file_path)
+            subs = parse_subtitle(file_path)
         except Exception:
             subs = []
         self.srt_subs = subs
@@ -992,7 +1066,7 @@ class AppMusicLyricsApp:
             self.entry_srt.insert(0, s["srt"])
             if os.path.exists(s["srt"]):
                 try:
-                    self.srt_subs = parse_srt(s["srt"])
+                    self.srt_subs = parse_subtitle(s["srt"])
                     self._update_progress_range_from_srt()
                 except Exception:
                     pass
@@ -1089,7 +1163,7 @@ class AppMusicLyricsApp:
     def start_conversion(self):
         srt_path = self.entry_srt.get()
         if not srt_path or not os.path.exists(srt_path):
-            messagebox.showerror("错误", "请先选择有效的 SRT 字幕文件！")
+            messagebox.showerror("错误", "请先选择有效的字幕文件（SRT 或 LRC）！")
             return
 
         font_name = self.combo_font.get()
