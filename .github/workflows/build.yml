@@ -150,10 +150,18 @@ jobs:
         with:
           path: artifacts
 
+      - name: 重命名为 ASCII 文件名（GitHub 资产名不支持中文）
+        run: |
+          set -e
+          mkdir -p release
+          cp "artifacts/windows-exe/滚动字幕生成器.exe"               "release/lyrics-subtitle-windows-x64.exe"
+          cp "artifacts/macos-app-arm64/滚动字幕生成器-macos-arm64.zip" "release/lyrics-subtitle-macos-arm64.zip"
+          ls -la release
+
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/windows-exe/滚动字幕生成器.exe
-            artifacts/macos-app-arm64/滚动字幕生成器-macos-arm64.zip
+            release/lyrics-subtitle-windows-x64.exe
+            release/lyrics-subtitle-macos-arm64.zip
           generate_release_notes: true
