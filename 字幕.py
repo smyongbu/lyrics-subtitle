@@ -1,12 +1,23 @@
 import re
 import os
 import sys
+import json
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 from tkinter.colorchooser import askcolor
 import tkinter.font as tkfont
+
+
+def get_config_path():
+    """返回用于保存上次设置与样式预设的配置文件路径（跨平台，存于用户目录）。"""
+    base = os.path.join(os.path.expanduser("~"), ".applemusic_lyrics")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        base = os.path.expanduser("~")
+    return os.path.join(base, "config.json")
 
 
 def get_ffmpeg_path():
@@ -239,6 +250,11 @@ class AppMusicLyricsApp:
         self.root.resizable(True, True)
         self.root.minsize(960, 660)
 
+        # ---- 配置（上次设置 + 样式预设）----
+        self.config_path = get_config_path()
+        self._config = self._load_config()
+        self.styles = self._config.get("styles", {}) if isinstance(self._config, dict) else {}
+
         self.hl_color     = "#FFFFFF"
         self.normal_color = "#808080"
         self.bg_color     = "#000000"
@@ -341,6 +357,9 @@ class AppMusicLyricsApp:
         if default_font:
             self.combo_font.set(default_font)
         self.combo_font.bind("<<ComboboxSelected>>", self.update_preview)
+        # 键盘上/下方向键切换字体（不展开下拉，直接切换并刷新预览）
+        self.combo_font.bind("<Up>", lambda e: self._cycle_font(-1))
+        self.combo_font.bind("<Down>", lambda e: self._cycle_font(1))
 
         ttk.Label(frame_cfg, text="高亮字号:").grid(row=1, column=0, sticky="w", pady=5)
         self.scale_fs_hl = ttk.Scale(frame_cfg, from_=30, to=150, value=76, command=self.update_labels)
@@ -442,7 +461,22 @@ class AppMusicLyricsApp:
 
         self.toggle_video_widgets()
 
-        # ---- 5. 生成按钮 ----
+        # ---- 5. 样式预设（一次性保存 / 载入 2~4 区的全部设置）----
+        frame_style = ttk.LabelFrame(left_panel, text=" 5. 样式预设 ", padding=10)
+        frame_style.pack(fill="x", padx=15, pady=5)
+
+        ttk.Label(frame_style, text="选择样式:").grid(row=0, column=0, sticky="w")
+        self.combo_style = ttk.Combobox(frame_style, values=sorted(self.styles.keys()),
+                                        width=20, state="readonly")
+        self.combo_style.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.combo_style.bind("<<ComboboxSelected>>", self.on_style_selected)
+
+        btn_bar = ttk.Frame(frame_style)
+        btn_bar.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(btn_bar, text="保存为样式", command=self.save_style, width=11).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_bar, text="删除样式", command=self.delete_style, width=11).pack(side="left")
+
+        # ---- 6. 生成按钮 ----
         self.btn_convert = ttk.Button(left_panel,
                                       text="🚀 一 键 生 成 A S S 字 幕 / 视 频",
                                       command=self.start_thread)
@@ -491,6 +525,14 @@ class AppMusicLyricsApp:
 
         # 容器尺寸變化時重新繪製（保持比例）
         self.preview_container.bind("<Configure>", lambda e: self.update_preview())
+
+        # 恢复上次的设置（若有）
+        last = self._config.get("last") if isinstance(self._config, dict) else None
+        if isinstance(last, dict):
+            self._apply_settings(last, with_srt=True)
+
+        # 关闭窗口时保存当前设置与样式
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # 延遲首次渲染，等視窗尺寸確定後再執行
         root.after(80, self.update_preview)
@@ -847,6 +889,153 @@ class AppMusicLyricsApp:
             self.bg_color = color[1]
             self.btn_bg_color.config(bg=self.bg_color)
             self.update_preview()
+
+    # ==================== 字体键盘切换 ====================
+    def _cycle_font(self, direction):
+        """用上/下方向键在字体列表中切换（direction: -1 上一个, +1 下一个）。"""
+        fonts = self.system_fonts
+        if not fonts:
+            return "break"
+        cur = self.combo_font.get()
+        try:
+            idx = fonts.index(cur)
+        except ValueError:
+            idx = 0
+        idx = max(0, min(len(fonts) - 1, idx + direction))
+        self.combo_font.set(fonts[idx])
+        self.update_preview()
+        return "break"   # 阻止 readonly 下拉框的默认行为，避免展开列表
+
+    # ==================== 设置持久化与样式预设 ====================
+    def _load_config(self):
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_config(self):
+        data = {
+            "last": self._collect_settings(with_srt=True),
+            "styles": self.styles,
+        }
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _collect_settings(self, with_srt=False):
+        """收集 2、3、4 区的全部设置（with_srt=True 时附带文件路径，用于记忆上次状态）。"""
+        s = {
+            # 2. 字体与间距
+            "font":     self.combo_font.get(),
+            "fs_hl":    int(self.scale_fs_hl.get()),
+            "fs_norm":  int(self.scale_fs_norm.get()),
+            "gap":      int(self.scale_gap.get()),
+            "res":      self.combo_res.get(),
+            # 3. 歌词颜色
+            "hl_color":     self.hl_color,
+            "normal_color": self.normal_color,
+            # 4. 视频导出
+            "export_video": bool(self.var_export_video.get()),
+            "fps":          self.combo_fps.get(),
+            "transparent":  bool(self.var_transparent.get()),
+            "fmt":          self.combo_fmt.get(),
+            "size":         self.combo_size.get(),
+            "bg_color":     self.bg_color,
+        }
+        if with_srt:
+            s["srt"] = self.entry_srt.get()
+        return s
+
+    def _apply_settings(self, s, with_srt=False):
+        """将一组设置应用到 2、3、4 区控件并刷新预览。"""
+        if not isinstance(s, dict):
+            return
+
+        if s.get("font") in self.system_fonts:
+            self.combo_font.set(s["font"])
+        if "fs_hl" in s:
+            self.scale_fs_hl.set(s["fs_hl"])
+        if "fs_norm" in s:
+            self.scale_fs_norm.set(s["fs_norm"])
+        if "gap" in s:
+            self.scale_gap.set(s["gap"])
+        if s.get("res") in self.combo_res.cget("values"):
+            self.combo_res.set(s["res"])
+
+        if s.get("hl_color"):
+            self.hl_color = s["hl_color"]
+            self.btn_hl_color.config(bg=self.hl_color)
+        if s.get("normal_color"):
+            self.normal_color = s["normal_color"]
+            self.btn_norm_color.config(bg=self.normal_color)
+
+        if "export_video" in s:
+            self.var_export_video.set(bool(s["export_video"]))
+        if s.get("fps") in self.combo_fps.cget("values"):
+            self.combo_fps.set(s["fps"])
+        if "transparent" in s:
+            self.var_transparent.set(bool(s["transparent"]))
+        if s.get("fmt") in self.combo_fmt.cget("values"):
+            self.combo_fmt.set(s["fmt"])
+        if s.get("size") in self.combo_size.cget("values"):
+            self.combo_size.set(s["size"])
+        if s.get("bg_color"):
+            self.bg_color = s["bg_color"]
+            self.btn_bg_color.config(bg=self.bg_color)
+
+        if with_srt and s.get("srt"):
+            self.entry_srt.delete(0, tk.END)
+            self.entry_srt.insert(0, s["srt"])
+            if os.path.exists(s["srt"]):
+                try:
+                    self.srt_subs = parse_srt(s["srt"])
+                    self._update_progress_range_from_srt()
+                except Exception:
+                    pass
+
+        # 同步导出区布局并刷新预览
+        self.toggle_video_widgets()
+        self.update_labels()
+
+    def on_style_selected(self, event=None):
+        name = self.combo_style.get()
+        if name in self.styles:
+            self._apply_settings(self.styles[name], with_srt=False)
+
+    def save_style(self):
+        name = simpledialog.askstring("保存样式", "请输入样式名称：", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.styles:
+            if not messagebox.askyesno("覆盖确认", f"样式「{name}」已存在，是否覆盖？"):
+                return
+        self.styles[name] = self._collect_settings(with_srt=False)
+        self.combo_style.config(values=sorted(self.styles.keys()))
+        self.combo_style.set(name)
+        self._save_config()
+
+    def delete_style(self):
+        name = self.combo_style.get()
+        if not name or name not in self.styles:
+            messagebox.showinfo("提示", "请先选择要删除的样式。")
+            return
+        if not messagebox.askyesno("删除确认", f"确定删除样式「{name}」吗？"):
+            return
+        del self.styles[name]
+        self.combo_style.config(values=sorted(self.styles.keys()))
+        self.combo_style.set("")
+        self._save_config()
+
+    def _on_close(self):
+        self._save_config()
+        self.root.destroy()
 
     def toggle_video_widgets(self):
         # 帧率始终可选（分辨率已移至「字体与间距」区域，用于预览比例联动）

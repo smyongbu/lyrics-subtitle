@@ -1,0 +1,159 @@
+name: Build & Release
+
+# 手动触发（Actions 页点 "Run workflow"），或推送 v 开头的 tag 时自动构建并发布 Release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # ==================== Windows 独立 EXE（内置 ffmpeg，无需任何依赖）====================
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 下载 win64 静态 ffmpeg（含 libass，单文件无外部依赖）
+        run: |
+          $ErrorActionPreference = "Stop"
+          # BtbN 的 GPL 静态构建：含 libass/libx264/libvpx 等，prores_ks/qtrle 为 ffmpeg 原生
+          $URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Write-Host "下载: $URL"
+          Invoke-WebRequest -Uri $URL -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extracted -Force
+          $exe = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName -Destination ffmpeg.exe -Force
+
+          Write-Host "=== 校验（能力）==="
+          & .\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          if (-not (& .\ffmpeg.exe -hide_banner -filters | Select-String -SimpleMatch " subtitles ")) {
+            throw "缺少 subtitles 滤镜(libass)"
+          }
+          foreach ($enc in @("prores_ks", "libvpx-vp9", "qtrle", "libx264")) {
+            if (-not (& .\ffmpeg.exe -hide_banner -encoders | Select-String -SimpleMatch $enc)) {
+              throw "缺少 $enc 编码器"
+            }
+          }
+          Write-Host "win64 静态 ffmpeg 就绪"
+
+      - name: PyInstaller 打包为独立 EXE（内置 ffmpeg）
+        run: |
+          $ErrorActionPreference = "Stop"
+          pyinstaller --onefile --windowed `
+            --name "滚动字幕生成器" `
+            --add-binary "ffmpeg.exe;." `
+            --noconfirm --clean `
+            字幕.py
+          Write-Host "=== dist 产物 ==="
+          Get-ChildItem dist
+
+      - name: 上传构建产物（在 Actions 运行页底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/滚动字幕生成器.exe
+          if-no-files-found: error
+
+  # ==================== macOS Apple 芯片(arm64) 独立 .app ====================
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python (arm64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 下载 arm64 静态 ffmpeg（含 libass，自包含单文件）
+        run: |
+          set -e
+          URL="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+          echo "下载: $URL"
+          curl -fL -o ffmpeg.zip "$URL"
+          unzip -o ffmpeg.zip
+          test -f ffmpeg
+          chmod +x ffmpeg
+          codesign --force -s - ffmpeg || true
+
+          echo "=== 校验（架构 + 能力）==="
+          file ffmpeg
+          ./ffmpeg -hide_banner -version | head -1
+          ./ffmpeg -hide_banner -filters  | grep -q ' subtitles ' || { echo "缺少 subtitles 滤镜(libass)"; exit 1; }
+          for enc in prores_ks libvpx-vp9 qtrle libx264; do
+            ./ffmpeg -hide_banner -encoders | grep -q "$enc" || { echo "缺少 $enc 编码器"; exit 1; }
+          done
+          echo "arm64 静态 ffmpeg 就绪"
+
+      - name: PyInstaller 打包为独立 .app（内置 ffmpeg）
+        run: |
+          set -e
+          pyinstaller --onefile --windowed \
+            --name "滚动字幕生成器" \
+            --add-binary "ffmpeg:." \
+            --noconfirm --clean \
+            字幕.py
+          echo "=== dist 产物 ==="
+          ls -la dist
+
+      - name: 对 .app 做整体 ad-hoc 签名
+        run: |
+          set -e
+          codesign --force --deep -s - "dist/滚动字幕生成器.app" || true
+          codesign --verify --deep --strict "dist/滚动字幕生成器.app" && echo "签名校验通过" || echo "签名有警告（不影响本机右键打开运行）"
+
+      - name: 打包 .app 为 zip
+        run: |
+          set -e
+          cd dist
+          zip -r -y "滚动字幕生成器-macos-arm64.zip" "滚动字幕生成器.app"
+          ls -la
+
+      - name: 上传构建产物（在 Actions 运行页底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-arm64
+          path: dist/滚动字幕生成器-macos-arm64.zip
+          if-no-files-found: error
+
+  # ==================== 推送 tag 时，将两个产物发布到 GitHub Release ====================
+  release:
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows-exe/滚动字幕生成器.exe
+            artifacts/macos-app-arm64/滚动字幕生成器-macos-arm64.zip
+          generate_release_notes: true
